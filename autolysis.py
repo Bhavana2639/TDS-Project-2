@@ -1,108 +1,123 @@
+# /// script
+# dependencies = [
+#   "os",
+#   "pandas",
+#   "requests",
+#   "seaborn",
+#   "matplotlib",
+#   "argparse",
+#   "dotenv",
+# ///
+
 import os
-import sys
 import pandas as pd
-import seaborn as sns
+import requests
 import matplotlib.pyplot as plt
-from openai import ChatCompletion
-import openai
+import seaborn as sns
+import argparse
+from dotenv import load_dotenv
 
-# Ensure the environment variable for AI Proxy token is set
+# Load environment variables
+load_dotenv()
 AIPROXY_TOKEN = os.getenv("AIPROXY_TOKEN")
+
+
 if not AIPROXY_TOKEN:
-    print("Error: AIPROXY_TOKEN environment variable not set.")
-    sys.exit(1)
+    print("Error: AIPROXY_TOKEN is not set. Please set the token as an environment variable.")
+    exit(1)
 
-# Initialize OpenAI client
-openai.api_key = AIPROXY_TOKEN
+def llm_analysis(dataset_summary):
+    dataset_summary_str = dataset_summary.head(10).to_string()
+    url = "https://aiproxy.sanand.workers.dev/openai/v1/chat/completions"
 
-def analyze_dataset(file_path):
-    # Load the dataset
-    try:
-        df = pd.read_csv(file_path)
-    except Exception as e:
-        print(f"Error loading file: {e}")
-        sys.exit(1)
-
-    # Perform generic analysis
-    analysis = {
-        "columns": list(df.columns),
-        "dtypes": df.dtypes.apply(str).to_dict(),
-        "summary_stats": df.describe(include='all').to_dict(),
-        "missing_values": df.isnull().sum().to_dict()
+    headers = {
+        'Authorization': f'Bearer {AIPROXY_TOKEN}',
+        'Content-Type': 'application/json',
     }
-    return df, analysis
 
-def generate_visualizations(df, output_dir):
-    # Generate a correlation heatmap if applicable
-    numeric_columns = df.select_dtypes(include=['number']).columns
-    if len(numeric_columns) > 1:
-        corr = df[numeric_columns].corr()
-        plt.figure(figsize=(10, 8))
-        sns.heatmap(corr, annot=True, cmap="coolwarm")
-        plt.title("Correlation Heatmap")
-        plt.savefig(os.path.join(output_dir, "correlation_heatmap.png"))
-        plt.close()
+    data = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are an assistant that analyzes datasets and provides good and detailed insights."
+            },
+            {
+                "role": "user",
+                "content": f"The dataset summary: {dataset_summary_str}. Can you analyze it and provide insights?"
+            }
+        ]
+    }
 
-    # Create a distribution plot for the first numeric column
-    if len(numeric_columns) > 0:
-        plt.figure(figsize=(8, 6))
-        sns.histplot(df[numeric_columns[0]], kde=True)
-        plt.title(f"Distribution of {numeric_columns[0]}")
-        plt.savefig(os.path.join(output_dir, f"{numeric_columns[0]}_distribution.png"))
-        plt.close()
-
-def narrate_story(analysis, output_dir):
-    # Generate a narrative using LLM
     try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are a data scientist narrating the story of a dataset."},
-                {"role": "user", "content": f"Here's the analysis of the dataset: {analysis}"}
-            ]
-        )
-        story = response['choices'][0]['message']['content']
-    except Exception as e:
-        story = f"Error generating narrative: {e}"
-    
-    # Write the story to README.md
-    with open(os.path.join(output_dir, "README.md"), "w") as f:
-        f.write(story)
+        response = requests.post(url, headers=headers, json=data)
+        response.raise_for_status()
+        analysis_results = response.json()
+        return analysis_results['choices'][0]['message']['content']
+    except requests.RequestException as e:
+        print(f"Error querying AI proxy: {e}")
+        return "AI analysis could not be performed due to an error."
 
-def analyze_and_generate_output(file_path):
-    # Define output directory based on file name
-    base_name = os.path.splitext(os.path.basename(file_path))[0]
-    output_dir = os.path.join(".", base_name)
-    os.makedirs(output_dir, exist_ok=True)
+def correlation_mapper(df):
+    numeric_df = df.select_dtypes(include='number').dropna()
 
-    # Analyze dataset
-    df, analysis = analyze_dataset(file_path)
+    if numeric_df.empty:
+        print("Warning: No numerical columns available for correlation heatmap.")
+        return None
 
-    # Generate visualizations
-    generate_visualizations(df, output_dir)
+    correlation_matrix = numeric_df.corr()
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(correlation_matrix, annot=True, cmap="coolwarm", fmt=".2f", cbar=True)
 
-    # Narrate the story
-    narrate_story(analysis, output_dir)
+    correlation_plot_path = "correlation_heatmap.png"
+    plt.savefig(correlation_plot_path)
+    plt.close()
+    return correlation_plot_path
 
-    return output_dir
-
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python autolysis.py dataset1.csv dataset2.csv ...")
-        sys.exit(1)
-
-    file_paths = sys.argv[1:]
-    output_dirs = []
-
-    # Process each dataset file
-    for file_path in file_paths:
-        if os.path.exists(file_path):
-            output_dir = analyze_and_generate_output(file_path)
-            output_dirs.append(output_dir)
+def gen_readme(df, analysis, correlation_plot_path):
+    with open("README.md", "w") as file:
+        file.write("## Data Summary\n")
+        file.write(f"{df.describe()}\n")
+        file.write("# Dataset Analysis Report\n")
+        file.write("## Insights from AI Analysis\n")
+        file.write(f"{analysis}\n")
+        if correlation_plot_path:
+            file.write("## Data Visualizations can be found in the directory...\n")
         else:
-            print(f"File {file_path} not found!")
+            file.write("## Data Visualizations\nNo numerical data available for a correlation heatmap.\n")
 
-    print(f"Analysis completed. Results saved in directories: {', '.join(output_dirs)}")
+def read_csv_with_encodings(file_path):
+    encodings_to_try = ['utf-8', 'ISO-8859-1', 'latin1', 'utf-16']
+    for encoding in encodings_to_try:
+        try:
+            print(f"Trying to read the file with encoding: {encoding}")
+            df = pd.read_csv(file_path, encoding=encoding)
+            return df
+        except UnicodeDecodeError:
+            print(f"Failed to read the file with encoding: {encoding}")
+    print("Error: Could not read the file with any of the tried encodings.")
+    exit(1)
+
+def main(file_path):
+    if not os.path.exists(file_path):
+        print(f"Error: The file at {file_path} does not exist.")
+        return
+
+    df = read_csv_with_encodings(file_path)
+
+    correlation_plot_path = correlation_mapper(df)
+    if correlation_plot_path:
+        print(f"Correlation Heatmap saved at: {correlation_plot_path}")
+
+    analysis_results = llm_analysis(df)
+
+    gen_readme(df, analysis_results, correlation_plot_path)
+    print("README.md file generated successfully.")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='Run dataset analysis')
+    parser.add_argument('file_path', type=str, help='Path to the CSV file')
+
+    args = parser.parse_args()
+
+    main(args.file_path)
