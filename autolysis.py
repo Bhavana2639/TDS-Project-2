@@ -1,350 +1,426 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "seaborn",
-#   "pandas",
-#   "matplotlib",
 #   "httpx",
-#   "chardet",
-#   "ipykernel",
-#   "openai",
+#   "pandas",
 #   "numpy",
-#   "scipy",
+#   "matplotlib",
+#   "seaborn",
+#   "chardet",
+#   "scikit-learn",
+#   "tabulate",
+#   "scikit-learn"
 # ]
 # ///
-
 import os
 import sys
+import subprocess
+import numpy as np
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
-import httpx
+from scipy.stats import ttest_ind, f_oneway
+from sklearn.ensemble import IsolationForest
+from sklearn.cluster import KMeans
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score, mean_squared_error
+from dateutil import parser
 import chardet
-from pathlib import Path
-import asyncio
-import scipy.stats as stats
-from PIL import Image
-import numpy as np
+import json
+import re
+import hashlib
 
-# Ensure UTF-8 output for compatibility
-if sys.stdout.encoding != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8')
+# Environment variable for AI Proxy token
+AIPROXY_TOKEN = os.environ.get("AIPROXY_TOKEN")
+if not AIPROXY_TOKEN:
+    raise EnvironmentError("AIPROXY_TOKEN is not set. Please set it before running the script.")
 
-# Constants
-API_URL = "https://aiproxy.sanand.workers.dev/openai/v1/chat/completions"
+def detect_encoding(file_path):
+    """
+    Detects the file encoding using chardet.
+    """
+    with open(file_path, 'rb') as file:
+        result = chardet.detect(file.read())
+        return result['encoding']
 
-# Helper Functions
+def parse_date_with_regex(date_str):
+    """
+    Attempts to parse date string using regular expressions.
+    """
+    if not isinstance(date_str, str):  
+        return date_str  
 
-def get_token():
-    """Retrieve API token from environment variables."""
+    if not re.search(r'\d', date_str):  # Check for digits in the string
+        return np.nan
+
+    patterns = [
+        (r"\d{2}-[A-Za-z]{3}-\d{4}", "%d-%b-%Y"), 
+        (r"\d{2}-[A-Za-z]{3}-\d{2}", "%d-%b-%y"),  
+        (r"\d{4}-\d{2}-\d{2}", "%Y-%m-%d"),  
+        (r"\d{2}/\d{2}/\d{4}", "%m/%d/%Y"),  
+        (r"\d{2}/\d{2}/\d{4}", "%d/%m/%Y")
+    ]
+
+    for pattern, date_format in patterns:
+        if re.match(pattern, date_str):
+            try:
+                return pd.to_datetime(date_str, format=date_format, errors='coerce')
+            except Exception as e:
+                print(f"Error parsing date: {date_str} with format {date_format}. Error: {e}")
+                return np.nan
+
     try:
-        return os.environ["AIPROXY_TOKEN"]
-    except KeyError as e:
-        print(f"Error: Environment variable '{e.args[0]}' not set.")
-        raise
-
-async def load_data(file_path):
-    """Load CSV data with encoding detection."""
-    if not os.path.isfile(file_path):
-        raise FileNotFoundError(f"Error: File '{file_path}' not found.")
-
-    with open(file_path, 'rb') as f:
-        result = chardet.detect(f.read())
-    encoding = result['encoding']
-    print(f"Detected file encoding: {encoding}")
-    return pd.read_csv(file_path, encoding=encoding or 'utf-8')
-
-async def async_post_request(headers, data):
-    """Make asynchronous HTTP POST requests."""
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(API_URL, headers=headers, json=data, timeout=30.0)
-            response.raise_for_status()
-            response.encoding = 'utf-8'
-            return response.json()['choices'][0]['message']['content']
-        except httpx.HTTPStatusError as e:
-            print(f"HTTP error occurred: {e}")
-            raise
-        except Exception as e:
-            print(f"Error during request: {e}")
-            raise
-
-async def generate_narrative(analysis, token, file_path):
-    """Generate a detailed narrative based on analysis results."""
-    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
-
-    prompt = (
-        f"You are an experienced data analyst. Analyze the following data for the file '{file_path.name}':\n\n"
-        f"Column Names: {list(analysis['summary'].keys())}\n"
-        f"Summary Statistics: {analysis['summary']}\n"
-        f"Missing Values: {analysis['missing_values']}\n"
-        f"Correlation Matrix: {analysis['correlation']}\n"
-        f"Numeric Trends: {analysis['numeric_trends']}\n"
-        f"Skewness and Kurtosis: {analysis['skewness_kurtosis']}\n"
-        f"Outliers: {analysis['outliers']}\n"
-        f"Hypothesis Test Results (if available): {analysis.get('hypothesis_test', 'None')}\n\n"
-        "Provide a detailed narrative with explicit statistical insights, "
-        "explaining correlations, trends, anomalies, and outliers. Suggest further analyses if necessary."
-    )
-
-    data = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}]}
-    try:
-        return await async_post_request(headers, data)
+        return parser.parse(date_str, fuzzy=True, dayfirst=False)
     except Exception as e:
-        print(f"Error during narrative generation: {e}")
-        return "Narrative generation failed due to an error."
+        print(f"Error parsing date with dateutil: {date_str}. Error: {e}")
+        return np.nan
 
-async def generate_refined_narrative(analysis, token, file_path):
-    """Generate a refined narrative through multiple iterations with the LLM."""
-    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
-    refined_narrative = ""
+def detect_date_column(column):
+    """
+    Identifies columns that are likely to contain date values.
+    """
+    if isinstance(column, str):
+        if any(keyword in column.lower() for keyword in ['date', 'time', 'timestamp']):
+            return True
 
-    # First query for general insights
-    prompt1 = (
-        f"Analyze the following data from file '{file_path.name}' and summarize it:\n"
-        f"Summary Statistics: {analysis['summary']}\n"
-        f"Missing Values: {analysis['missing_values']}\n"
-        f"Correlation Matrix: {analysis['correlation']}\n\n"
-        "Provide general trends and areas needing further analysis."
-    )
-    data1 = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt1}]}
-    response1 = await async_post_request(headers, data1)
-    refined_narrative += response1
+    sample_values = column.dropna().head(10)
+    date_patterns = [r"\d{2}-[A-Za-z]{3}-\d{2}", r"\d{2}-[A-Za-z]{3}-\d{4}", r"\d{4}-\d{2}-\d{2}", r"\d{2}/\d{2}/\d{4}"]
 
-    # Second query for specific insights on correlations
-    prompt2 = (
-        f"Based on the correlation matrix and numeric trends:\n"
-        f"Correlation Matrix: {analysis['correlation']}\n"
-        "Identify key variables with significant correlations and suggest possible causal relationships."
-    )
-    data2 = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt2}]}
-    response2 = await async_post_request(headers, data2)
-    refined_narrative += "\n\n" + response2
+    for value in sample_values:
+        if isinstance(value, str):
+            for pattern in date_patterns:
+                if re.match(pattern, value):
+                    return True
+    return False
 
-    return refined_narrative
-
-
-async def analyze_data(df, token):
-    """Perform detailed data analysis and request insights from LLM."""
-    if df.empty:
-        raise ValueError("Error: Dataset is empty.")
-
-    numeric_df = df.select_dtypes(include=['number'])
-    categorical_df = df.select_dtypes(include=['object', 'category'])
-
-    # Generate insights for numerical data
-    summary_stats = df.describe(include='all').to_dict()
-    missing_values = df.isnull().sum().to_dict()
-    correlation = numeric_df.corr().to_dict() if not numeric_df.empty else {}
-
-    # Extract specific trends for analysis
-    numeric_trends = {
-        column: {
-            "mean": df[column].mean(),
-            "std_dev": df[column].std(),
-            "max": df[column].max(),
-            "min": df[column].min()
-        }
-        for column in numeric_df.columns
-    }
-
-    # Calculate skewness and kurtosis
-    skewness_kurtosis = {
-        column: {
-            "skewness": stats.skew(df[column].dropna()),
-            "kurtosis": stats.kurtosis(df[column].dropna())
-        }
-        for column in numeric_df.columns
-    }
-
-    # Outlier detection
-    outliers = {
-        column: {
-            "outliers": list(df[column][
-                (df[column] > df[column].mean() + 3 * df[column].std()) |
-                (df[column] < df[column].mean() - 3 * df[column].std())
-            ])
-        }
-        for column in numeric_df.columns
-    }
-
-    # Hypothesis testing example
-    hypothesis_test = {}
-    if 'average_rating' in df.columns and 'num_pages' in df.columns:
-        t_stat, p_value = stats.ttest_ind(df['average_rating'].dropna(), df['num_pages'].dropna())
-        hypothesis_test = {'t_stat': t_stat, 'p_value': p_value}
-
-    analysis = {
-        'summary': summary_stats,
-        'missing_values': missing_values,
-        'correlation': correlation,
-        'numeric_trends': numeric_trends,
-        'skewness_kurtosis': skewness_kurtosis,
-        'outliers': outliers,
-        'hypothesis_test': hypothesis_test
-    }
-
-    # Request suggestions for further insights
+def read_csv(file_path):
+    """
+    Reads a CSV file, detects its encoding, and attempts to parse date columns.
+    """
     try:
-        prompt = (
-            f"Data analysis results for '{df.columns}':\n\n"
-            f"Summary Statistics: {summary_stats}\n"
-            f"Missing Values: {missing_values}\n"
-            f"Correlation Matrix: {correlation}\n"
-            f"Numeric Trends: {numeric_trends}\n"
-            f"Skewness and Kurtosis: {skewness_kurtosis}\n"
-            f"Outliers: {outliers}\n\n"
-            "Based on these results, provide detailed insights into the dataset, "
-            "highlight patterns, outliers, and possible future steps such as predictive modeling or clustering."
-        )
-        headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
-        data = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}]}
-        suggestions = await async_post_request(headers, data)
+        encoding = detect_encoding(file_path)
+        df = pd.read_csv(file_path, encoding=encoding, encoding_errors='replace')
+        for column in df.columns:
+            if df[column].dtype == object and detect_date_column(df[column]):
+                df[column] = df[column].apply(parse_date_with_regex)
+        return df
     except Exception as e:
-        suggestions = f"Error fetching suggestions: {e}"
+        print(f"Error reading the file: {e}")
+        sys.exit(1)
 
-    print("Data analysis complete.")
-    return analysis, suggestions
+
+def statistical_tests(df):
+    """
+    Performs t-tests and ANOVA on numerical columns to find statistically significant differences.
+    """
+    numeric_data = df.select_dtypes(include=[np.number])
+    results = {}
+
+    # Pairwise t-tests
+    for col1 in numeric_data.columns:
+        for col2 in numeric_data.columns:
+            if col1 != col2:
+                stat, p_value = ttest_ind(numeric_data[col1].dropna(), numeric_data[col2].dropna())
+                results[f"T-test: {col1} vs {col2}"] = {"Statistic": stat, "P-value": p_value}
     
-async def visualize_data(df, output_dir):
-    """Generate and save visualizations with detailed commentary on their relevance."""
-    sns.set(style="whitegrid")
-    numeric_columns = df.select_dtypes(include=['number']).columns
+    # ANOVA
+    if numeric_data.shape[1] > 2:
+        anova_stat, anova_p_value = f_oneway(*[numeric_data[col].dropna() for col in numeric_data.columns])
+        results["ANOVA"] = {"Statistic": anova_stat, "P-value": anova_p_value}
 
-    # Select columns for visualization
-    selected_columns = numeric_columns[:3] if len(numeric_columns) >= 3 else numeric_columns
+    return results
 
-    # Ensure output directory exists
-    output_dir.mkdir(parents=True, exist_ok=True)
+def perform_advanced_analysis(df):
+    """
+    Performs a comprehensive analysis of the dataframe, including summary statistics and outlier detection.
+    """
+    analysis = {
+        "shape": df.shape,
+        "columns": df.dtypes.to_dict(),
+        "missing_values": df.isnull().sum().to_dict(),
+        "summary_statistics": df.describe(include="all").to_dict(),
+    }
+    for column in df.select_dtypes(include=[np.datetime64]).columns:
+        df[column] = df[column].dt.strftime('%Y-%m-%d %H:%M:%S')
+    
+    outliers = detect_outliers(df)
+    if outliers is not None:
+        analysis["outliers"] = outliers.value_counts().to_dict()
+    
+    return analysis
 
-    # Generate and save visualizations with commentary
-    visualization_comments = []
+def detect_outliers(df):
+    """
+    Detects outliers in numeric columns using Isolation Forest.
+    """
+    numeric_data = df.select_dtypes(include=[np.number]).dropna()
+    if numeric_data.empty:
+        return None
+    iso = IsolationForest(contamination=0.05, random_state=42)
+    numeric_data["outliers"] = iso.fit_predict(numeric_data)
+    return numeric_data["outliers"]
 
-    for column in selected_columns:
-        plt.figure(figsize=(8, 6))  # Adjusted figure size for better readability
-        sns.histplot(df[column].dropna(), kde=True, color='cornflowerblue')  # Updated color
-        plt.title(f'Distribution of {column}', fontsize=14)  # Clearer title
-        plt.xlabel(column, fontsize=12)  # Added label with increased font size
-        plt.ylabel('Frequency', fontsize=12)
-        plt.grid(True, linestyle='--', alpha=0.7)  # Improved gridlines for clarity
-        file_name = output_dir / f'{column}_distribution.png'
-        plt.savefig(file_name, dpi=100)
-        plt.close()
+def regression_analysis(df):
+    """
+    Performs regression analysis on numeric columns.
+    """
+    numeric_data = df.select_dtypes(include=[np.number])
+    if numeric_data.shape[1] < 2:
+        return None
+    x = numeric_data.iloc[:, :-1]
+    y = numeric_data.iloc[:, -1]
+    model = LinearRegression()
+    model.fit(x, y)
+    predictions = model.predict(x)
+    feature_importance = dict(zip(x.columns, np.abs(model.coef_)))
+    return {
+        "MSE": mean_squared_error(y, predictions),
+        "R2": r2_score(y, predictions),
+        "Feature Importance": feature_importance,
+    }
 
-        # Add commentary on the visualization's relevance
-        comment = (
-            f"The distribution plot of '{column}' is useful for understanding the "
-            "spread and skewness of the data. The inclusion of a kernel density estimate (KDE) "
-            "provides a smoother representation of the data distribution, highlighting key trends like "
-            "central tendency and potential outliers. This visualization helps in detecting patterns such "
-            "as bimodal distributions, skewness, and unusual peaks in the data."
-        )
-        visualization_comments.append(comment)
+def clustering_analysis(df):
+    """
+    Performs clustering analysis on numeric columns using KMeans.
+    """
+    numeric_data = df.select_dtypes(include=[np.number]).dropna()
+    if numeric_data.empty:
+        return None, None
+    kmeans = KMeans(n_clusters=3, random_state=42)
+    numeric_data['Cluster'] = kmeans.fit_predict(numeric_data)
+    return numeric_data['Cluster'], numeric_data.index
 
-    if len(numeric_columns) > 1:
-        plt.figure(figsize=(10, 8))  # Larger heatmap size
-        corr = df[numeric_columns].corr()
-        sns.heatmap(
-            corr, annot=True, cmap='viridis', square=True,  # Updated color palette
-            cbar_kws={"shrink": 0.8}, annot_kws={"fontsize": 10}
-        )
-        plt.title('Correlation Heatmap', fontsize=16)  # Clearer title
-        plt.xticks(fontsize=12, rotation=45)  # Adjusted font size and rotation for clarity
+def visualize_advanced(df, output_folder):
+    """
+    Creates and saves various visualizations such as correlation heatmap, pairplot, and clustering scatter plot.
+    """
+    visualizations = []
+
+    numeric_data = df.select_dtypes(include=[np.number]).dropna()
+    
+    sns.set_palette("colorblind")
+    
+    if not numeric_data.empty:
+        # Correlation Heatmap
+        plt.figure(figsize=(10, 8))
+        correlation_matrix = numeric_data.corr()
+        sns.heatmap(correlation_matrix, annot=True, cmap="coolwarm", fmt=".2f", annot_kws={'size': 12},
+                    linewidths=1, cbar_kws={"shrink": 0.8})
+        plt.title("Correlation Heatmap", fontsize=18, pad=20)
+        plt.xticks(rotation=45, fontsize=12, ha='right')
         plt.yticks(fontsize=12)
-        file_name = output_dir / 'correlation_heatmap.png'
-        plt.savefig(file_name, dpi=100)
+        file_path = os.path.join(output_folder, "correlation_heatmap.png")
+        plt.savefig(file_path, bbox_inches='tight')
+        visualizations.append("Correlation Heatmap: Shows correlations between numerical features.")
         plt.close()
 
-        # Add commentary on the correlation heatmap
-        comment = (
-            "The correlation heatmap provides an overview of the relationships between numeric variables. "
-            "It helps in identifying strong correlations and potential multicollinearity issues. "
-            "By visualizing this matrix, key pairs of variables with high correlations can be spotted, "
-            "which may reveal underlying patterns or redundancies in the data."
-        )
-        visualization_comments.append(comment)
+    
+    # Clustering Scatter Plot with improved legend and axis labels
+    clusters, valid_indices = clustering_analysis(df)
+    if clusters is not None:
+        df_with_clusters = numeric_data.loc[valid_indices].copy()
+        df_with_clusters["Cluster"] = clusters.values
+        plt.figure(figsize=(10, 8))
+        palette = sns.color_palette("Set1", n_colors=len(np.unique(clusters)))
+        for cluster in np.unique(clusters):
+            subset = df_with_clusters[df_with_clusters["Cluster"] == cluster]
+            plt.scatter(subset.iloc[:, 0], subset.iloc[:, 1], 
+                        label=f"Cluster {cluster}", s=150, alpha=0.8, c=[palette[cluster]], edgecolor="k")
+        plt.title("Clustering Scatter Plot", fontsize=16)
+        plt.xlabel(df_with_clusters.columns[0], fontsize=12)
+        plt.ylabel(df_with_clusters.columns[1], fontsize=12)
+        plt.legend(title="Clusters", fontsize=12, loc="best")
+        plt.grid(True, linestyle="--", alpha=0.7)
+        file_path = os.path.join(output_folder, "clustering_scatter.png")
+        plt.savefig(file_path, bbox_inches='tight')
+        visualizations.append("Clustering Scatter Plot: Shows the clustering of data points in the 2D space.")
+        
+        # Pairplot with improved aesthetics
+    sns.set(style="whitegrid")
+    pairplot = sns.pairplot(df_with_clusters, hue="Cluster", palette="Set2", plot_kws={'alpha': 0.8})
+    pairplot.fig.suptitle("Pairplot of Numerical Features", fontsize=16)
+    pairplot.fig.tight_layout()
+    pairplot.fig.subplots_adjust(top=0.95)  # Title adjustment
+    file_path = os.path.join(output_folder, "pairplot.png")
+    pairplot.savefig(file_path, bbox_inches='tight')
+    visualizations.append("Pairplot: Shows pairwise relationships between numerical features.")
 
-    # Return visualizations and their associated comments
-    return visualization_comments
+    return visualizations
 
+def generate_summary(clusters, visualizations, analysis_results):
+    """
+    Generates a detailed summary of the analysis, visualizations, and clustering results.
+    """
+    summary = f"### Data Overview\n\nShape of Data: {analysis_results['shape']}\n"
+    summary += f"Columns and Data Types:\n{analysis_results['columns']}\n\n"
+    summary += f"Missing Values:\n{analysis_results['missing_values']}\n\n"
+    summary += f"Summary Statistics:\n{analysis_results['summary_statistics']}\n\n"
+    
+    if "outliers" in analysis_results:
+        summary += f"\nOutlier Analysis:\n{analysis_results['outliers']}\n"
+    
+    for vis in visualizations:
+        summary += f"\n- {vis}"
+    
+    return summary
 
-async def analyze_images(output_dir):
-    """Analyze generated images for quality or content using vision techniques."""
-    insights = {}
-    for img_path in output_dir.glob("*.png"):
-        try:
-            with Image.open(img_path) as img:
-                img_array = np.array(img)
-                # Example analysis: Check brightness
-                brightness = np.mean(img_array)
-                insights[img_path.name] = {
-                    "brightness": brightness,
-                    "size": img.size,
-                    "mode": img.mode
-                }
-        except Exception as e:
-            print(f"Error analyzing image {img_path.name}: {e}")
-    return insights
-
-async def save_narrative_with_images(narrative, output_dir):
-    """Save narrative to README.md and embed image links."""
-    readme_path = output_dir / 'README.md'
-    image_links = "\n".join(
-        [f"![{img.name}]({img.name})" for img in output_dir.glob('*.png')]
-    )
-    with open(readme_path, 'w', encoding='utf-8') as f:
-        f.write(narrative + "\n\n" + image_links)
-    print(f"Narrative successfully written to {readme_path}")
-
-async def main(file_path):
-    """Main function to orchestrate the data analysis workflow."""
-    print("Starting autolysis process...")
-
-    file_path = Path(file_path)
-    if not file_path.is_file():
-        print(f"Error: File '{file_path}' does not exist.")
-        sys.exit(1)
-
+def query_llm(function_call):
+    """
+    Queries the LLM with the function call for dynamic analysis-based prompts.
+    """
+    prompt = f"""
+    Use the following information to generate a detailed analysis report:
+    - {function_call}
+    """
     try:
-        token = get_token()
+        url = "https://aiproxy.sanand.workers.dev/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {AIPROXY_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": "gpt-4o-mini",  # Supported chat model
+            "messages": [
+                {"role": "system", "content": "You are a helpful data analysis assistant. Provide insights, suggestions, and implications based on the given analysis and visualizations."},
+                {"role": "user", "content": prompt},
+            ],
+        }
+        payload_json = json.dumps(payload)
+        curl_command = [
+            "curl",
+            "-X", "POST", url,
+            "-H", f"Authorization: Bearer {AIPROXY_TOKEN}",
+            "-H", "Content-Type: application/json",
+            "-d", payload_json
+        ]
+        result = subprocess.run(curl_command, capture_output=True, text=True)
+        if result.returncode == 0:
+            response_data = json.loads(result.stdout)
+            return response_data["choices"][0]["message"]["content"]
+        else:
+            raise Exception(f"Error in curl request: {result.stderr}")
     except Exception as e:
-        print(e)
-        sys.exit(1)
+        print(f"Error querying AI Proxy: {e}")
+        return "Error: Unable to generate narrative."
 
-    try:
-        df = await load_data(file_path)
-    except FileNotFoundError as e:
-        print(e)
-        sys.exit(1)
-    print("Dataset loaded successfully.")
+def cache_llm_query(function_call, cache_dir="llm_cache"):
+    """
+    Caches LLM query results to avoid redundant calls.
+    """
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
 
-    print("Analyzing data...")
-    try:
-        analysis, suggestions = await analyze_data(df, token)
-    except ValueError as e:
-        print(e)
-        sys.exit(1)
+    # Hash the function_call to create a unique key
+    query_hash = hashlib.md5(function_call.encode()).hexdigest()
+    cache_file = os.path.join(cache_dir, f"{query_hash}.json")
 
-    output_dir = Path(file_path.stem)
-    output_dir.mkdir(exist_ok=True)
+    # Check if cache exists
+    if os.path.exists(cache_file):
+        with open(cache_file, "r") as f:
+            return json.load(f)
 
-    print("Generating visualizations...")
-    await visualize_data(df, output_dir)
+    # If not cached, query the LLM
+    response = query_llm(function_call)
+    with open(cache_file, "w") as f:
+        json.dump(response, f)
 
-    print("Analyzing generated images...")
-    image_insights = await analyze_images(output_dir)
+    return response
+        
+        
+def create_readme(analysis, visualizations, story, output_folder):
+    """
+    Create a structured and detailed README file to summarize the analysis, visualizations, and narrative.
+    """
+    readme_path = os.path.join(output_folder, "README.md")
+    with open(readme_path, "w") as f:
+        # Introduction Section
+        f.write("# Comprehensive Data Analysis Report\n\n")
+        f.write("This report provides an in-depth analysis of the dataset, including data structure, insights, visualizations, and actionable recommendations.\n\n")
 
-    print("Generating refined narrative using iterative LLM calls...")
-    narrative = await generate_refined_narrative(analysis, token, file_path)
+        # Data Overview Section
+        f.write("## Data Overview\n\n")
+        f.write(f"### Dataset Shape\n\n**Rows**: {analysis['shape'][0]}, **Columns**: {analysis['shape'][1]}\n\n")
+        f.write("### Columns and Data Types\n\n")
+        f.write(pd.DataFrame(list(analysis['columns'].items()), columns=["Column", "Data Type"]).to_markdown(index=False))
+        f.write("\n\n")
+        f.write("### Missing Values\n\n")
+        f.write(pd.DataFrame(list(analysis['missing_values'].items()), columns=["Column", "Missing Values"]).to_markdown(index=False))
+        f.write("\n\n")
+
+        # Summary Statistics Section
+        f.write("## Summary Statistics\n\n")
+        summary_stats = pd.DataFrame(analysis["summary_statistics"])
+        f.write(summary_stats.to_markdown())
+        f.write("\n\n")
+
+        # Visualizations Section
+        f.write("## Visualizations\n\n")
+        f.write("Below are the key visualizations generated during the analysis:\n\n")
+        for vis in visualizations:
+            vis_filename = os.path.basename(vis)
+            if "correlation_heatmap" in vis_filename:
+                explanation = "The heatmap highlights the correlations between numerical features. Strong correlations may indicate predictive relationships."
+            elif "clustering_scatter" in vis_filename:
+                explanation = "The scatter plot shows clustering patterns, which can help identify natural groupings in the data."
+            elif "pairplot" in vis_filename:
+                explanation = "The pairplot provides pairwise visualizations of feature relationships, which are useful for identifying trends and dependencies."
+            else:
+                explanation = "This visualization provides additional insights into the dataset."
+    
+            f.write(f"- **{explanation}**\n  ![Visualization]({vis_filename})\n\n")
 
 
-    if narrative != "Narrative generation failed due to an error.":
-        await save_narrative_with_images(narrative, output_dir)
-    else:
-        print("Narrative generation failed.")
+        # Narrative Section
+        f.write("## Key Insights and Narrative\n\n")
+        f.write("### Highlights\n\n")
+        f.write(story)
+        f.write("\n\n")
+
+        # Recommendations Section
+        f.write("## Conclusions and Recommendations\n\n")
+        f.write("### Summary\n\n")
+        f.write("The analysis revealed significant trends and patterns that are critical for understanding the dataset. Recommendations for further exploration and potential action items are outlined below:\n\n")
+        f.write("- Address missing data through imputation or collection improvements.\n")
+        f.write("- Focus on high-correlation features for predictive modeling.\n")
+        f.write("- Investigate outliers to understand their context and impact.\n")
+        f.write("- Use clustering insights for targeted interventions or segmentation.\n")
+        f.write("\n")
+        
+
+def main(file_path):
+    """
+    Main function to process the data and generate results.
+    """
+    dataset_name = os.path.splitext(os.path.basename(file_path))[0]
+    output_folder = os.path.join(os.getcwd(), dataset_name)
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    df = read_csv(file_path)        
+    
+    # Perform analysis
+    analysis_results = perform_advanced_analysis(df)
+    clusters, cluster_indices = clustering_analysis(df)
+    analysis_results["statistical_tests"] = statistical_tests(df)
+
+    # Generate visualizations
+    visualizations = visualize_advanced(df, output_folder)
+    
+    # Generate summary
+    summary = generate_summary(clusters, visualizations, analysis_results)
+    
+    # Generate Story
+    story = cache_llm_query(summary)
+    
+    # Create the README.md
+    create_readme(analysis_results, visualizations, story, output_folder)
+
+    print(f"Analysis Complete. Visualizations and README saved in '{output_folder}' folder.")
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: python script.py <file_path>")
+        print("Usage: uv run autolysis.py dataset.csv")
         sys.exit(1)
-    asyncio.run(main(sys.argv[1]))
+    
+    input_file = sys.argv[1]
+    main(input_file)
